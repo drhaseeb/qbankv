@@ -13,36 +13,34 @@ from google import genai
 # ==============================================================================
 st.set_page_config(page_title="FCPS Auditor", layout="centered", page_icon="🩺")
 
-# CUSTOM CSS: Fixes button alignment, colors, and spacing
 st.markdown("""
 <style>
-    /* Make buttons fill their columns and align perfectly */
+    /* Full width buttons */
     div.stButton > button {
         width: 100%;
         border-radius: 8px;
-        height: 38px;
-        border: 1px solid #e0e0e0;
+        height: 40px;
         font-weight: 500;
+        border: 1px solid #ddd;
     }
-    
-    /* Primary Action Button (Verify) */
     div.stButton > button[kind="primary"] {
         background-color: #0f9d58; 
         border-color: #0f9d58;
     }
-
-    /* Card-like look for expanders */
-    .streamlit-expanderHeader {
-        background-color: #f8f9fa;
-        border-radius: 8px;
+    
+    /* Clean Card Style */
+    .element-container {
+        margin-bottom: 1rem;
     }
     
-    /* Clean status badges */
-    .status-badge {
-        padding: 4px 8px;
-        border-radius: 4px;
-        font-size: 0.8em;
-        font-weight: bold;
+    /* Explanation Text Style (Neutral Gray) */
+    .explanation-text {
+        background-color: #f8f9fa;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 4px solid #ced4da;
+        color: #495057;
+        font-size: 0.95em;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -58,11 +56,13 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # 2. DATA MODELS
 # ==============================================================================
 class QuestionAudit(BaseModel):
-    question_id: int  # Mapping back by ID is safer than Index
+    question_id: int
     status: str       # "PASS" or "FAIL"
     feedback: Optional[str] = None
 
 class AuditResponse(BaseModel):
+    global_verdict: str # "PASS" or "FAIL"
+    global_summary: Optional[str] = None
     evaluations: List[QuestionAudit]
 
 @dataclass
@@ -97,9 +97,25 @@ def try_connect(password):
     except Exception as e:
         return False, str(e)
 
-def fetch_variant_group():
+def fetch_variant_group(skipped_ids):
     conn = get_db()
-    group_query = "SELECT DISTINCT variant_group_id FROM question_bank WHERE status != 'verified' LIMIT 1"
+    
+    # Exclude skipped IDs dynamically
+    exclusion_clause = ""
+    if skipped_ids:
+        # Format list for SQL IN clause safely
+        ids_str = ",".join(map(str, skipped_ids))
+        exclusion_clause = f"AND variant_group_id NOT IN ({ids_str})"
+
+    # Fetch ONE unverified group that hasn't been skipped
+    group_query = f"""
+        SELECT DISTINCT variant_group_id 
+        FROM question_bank 
+        WHERE status != 'verified' 
+        {exclusion_clause}
+        LIMIT 1
+    """
+    
     group_row = conn.run(group_query)
     
     if not group_row:
@@ -108,7 +124,6 @@ def fetch_variant_group():
 
     target_group_id = group_row[0][0]
 
-    # Fetch questions
     questions_query = """
         SELECT question_id, question_json, explanation, variant_type, role, status
         FROM question_bank WHERE variant_group_id = :gid ORDER BY question_id ASC
@@ -152,72 +167,60 @@ if not st.session_state.get("authenticated", False):
         valid, err = try_connect(pwd)
         if valid:
             st.session_state["authenticated"] = True
+            st.session_state["skipped_groups"] = [] # Init skip list
             st.rerun()
         else:
             st.error(err)
     st.stop()
 
 # ==============================================================================
-# 5. MAIN UI & PLACEHOLDER LOGIC
+# 5. MAIN UI
 # ==============================================================================
 if 'group_data' not in st.session_state:
-    st.session_state.group_data = fetch_variant_group()
+    st.session_state.group_data = fetch_variant_group(st.session_state.get("skipped_groups", []))
 
 group_id, questions = st.session_state.group_data
 
-# Top Bar
-c1, c2 = st.columns([0.85, 0.15])
-with c1:
-    st.caption(f"Reviewing Variant Group: {group_id}")
-    st.progress(100)
-with c2:
-    if st.button("🔄", help="Refresh Data"):
-        st.cache_data.clear()
-        st.session_state.group_data = fetch_variant_group()
-        st.rerun()
+# --- TOP GLOBAL VERDICT PLACEHOLDER ---
+# This sits at the very top. AI will inject "PASS" or "FAIL" here.
+global_verdict_container = st.empty()
+global_verdict_container.info("⏳ AI Audit in progress...")
 
 if not group_id:
     st.balloons()
-    st.success("You are all caught up! No unverified questions found.")
+    st.success("All questions reviewed!")
+    if st.button("Reset Skips & Review Again"):
+        st.session_state["skipped_groups"] = []
+        st.cache_data.clear()
+        st.session_state.group_data = fetch_variant_group([])
+        st.rerun()
     st.stop()
 
-# --- PLACEHOLDER REGISTRY ---
-# We store widgets here to update them later with AI results
-ai_status_icons = {}
-ai_feedback_boxes = {}
+# --- FEEDBACK PLACEHOLDERS MAP ---
+# We track where to put specific error messages
+question_feedback_map = {}
 
-# --- RENDER QUESTIONS LOOP ---
+# --- RENDER QUESTIONS ---
 for q in questions:
     
-    # CARD CONTAINER
     with st.container(border=True):
-        
-        # 1. HEADER ROW (Role | Status | AI Spinner)
-        h1, h2, h3 = st.columns([0.6, 0.25, 0.15])
-        
-        with h1:
-            # Clean Role Badge
+        # Header: Role + Status (No AI Icon)
+        c1, c2 = st.columns([0.8, 0.2])
+        with c1:
             icon = "🔹" if q.role == "Primary" else "🔗"
-            st.markdown(f"**{icon} {q.role}**")
-            st.caption(f"{q.variant_type}")
-
-        with h2:
-            # Status Badge
+            st.markdown(f"**{icon} {q.role}** ({q.variant_type})")
+        with c2:
             if q.status == 'active':
-                st.markdown('<span style="color:green; background:#e6f4ea; padding:2px 6px; border-radius:4px;">ACTIVE</span>', unsafe_allow_html=True)
+                st.caption("✅ ACTIVE")
             else:
-                st.markdown('<span style="color:red; background:#fce8e6; padding:2px 6px; border-radius:4px;">INACTIVE</span>', unsafe_allow_html=True)
+                st.caption("🚫 INACTIVE")
 
-        with h3:
-            # AI Placeholders
-            ai_status_icons[q.question_id] = st.empty()
-            ai_status_icons[q.question_id].write("⏳") # Loading state
+        # ** ERROR MESSAGE PLACEHOLDER **
+        # This remains hidden unless AI finds an error in this specific question
+        question_feedback_map[q.question_id] = st.empty()
 
-        # 2. FEEDBACK ROW (Hidden unless fail)
-        ai_feedback_boxes[q.question_id] = st.empty()
-
-        # 3. CONTENT AREA
-        edit_key = f"edit_mode_{q.question_id}"
+        # Content
+        edit_key = f"edit_{q.question_id}"
         
         if st.session_state.get(edit_key, False):
             # === EDIT MODE ===
@@ -228,7 +231,7 @@ for q in questions:
             new_expl = st.text_area("Explanation", q.explanation)
             
             b1, b2 = st.columns(2)
-            if b1.button("💾 Save Changes", key=f"sv_{q.question_id}", type="primary"):
+            if b1.button("💾 Save", key=f"sv_{q.question_id}", type="primary"):
                 new_json = {"stem": new_stem, "options": q.options, "correct_key": new_key}
                 save_edit(q.question_id, new_json, new_expl)
                 st.session_state[edit_key] = False
@@ -236,84 +239,88 @@ for q in questions:
             if b2.button("Cancel", key=f"cn_{q.question_id}"):
                 st.session_state[edit_key] = False
                 st.rerun()
-                
         else:
             # === READ MODE ===
             st.write(q.stem)
             
-            # Options Display (Compact)
-            opt_md = ""
+            # Clean Options List
             for opt in q.options:
-                key = opt['key']
-                text = opt['text']
+                key, text = opt['key'], opt['text']
                 if key == q.correct_key:
-                    opt_md += f"- :green[**{key}) {text}**] (Key)\n"
+                    st.markdown(f":green[**{key}) {text}**]")
                 else:
-                    opt_md += f"- {key}) {text}\n"
-            st.markdown(opt_md)
+                    st.markdown(f"{key}) {text}")
             
-            # Explanation (Collapsible)
+            # Neutral Explanation (No Blue Box)
             with st.expander("Show Explanation"):
-                st.info(q.explanation)
+                st.markdown(f"""
+                <div class="explanation-text">
+                    {q.explanation}
+                </div>
+                """, unsafe_allow_html=True)
 
-            # Footer Actions
+            # Toolbar
             f1, f2 = st.columns(2)
             if f1.button("✏️ Edit", key=f"ed_{q.question_id}"):
                 st.session_state[edit_key] = True
                 st.rerun()
             
-            tog_label = "Deactivate 🚫" if q.status == 'active' else "Activate ✅"
-            if f2.button(tog_label, key=f"tg_{q.question_id}"):
+            tog_text = "Deactivate" if q.status == 'active' else "Activate"
+            if f2.button(tog_text, key=f"tg_{q.question_id}"):
                 new_s = 'inactive' if q.status == 'active' else 'active'
                 update_status_single(q.question_id, new_s)
                 st.rerun()
 
-# --- BOTTOM ACTION BAR ---
+# --- BOTTOM BAR ---
 st.divider()
-ac1, ac2 = st.columns(2)
+bc1, bc2 = st.columns(2)
 
-if ac1.button("⏭️ Skip Group"):
-    st.session_state.group_data = fetch_variant_group()
+if bc1.button("⏭️ Skip Group"):
+    # Add current group to skip list
+    st.session_state["skipped_groups"].append(group_id)
+    # Clear current data to force fetch next
+    st.session_state.group_data = fetch_variant_group(st.session_state["skipped_groups"])
     st.rerun()
 
-if ac2.button("✅ Verify All", type="primary"):
+if bc2.button("✅ Verify All", type="primary"):
     mark_group_verified(group_id)
-    st.toast("Marked as Verified!")
-    st.session_state.group_data = fetch_variant_group()
+    st.toast("Verified!")
+    st.session_state.group_data = fetch_variant_group(st.session_state["skipped_groups"])
     st.rerun()
 
 # ==============================================================================
-# 6. AI INJECTION (Runs automatically at end of script)
+# 6. AI INJECTION (Runs automatically)
 # ==============================================================================
-prompt = "Audit these medical questions (FCPS Part 1). Focus ONLY on factual errors.\n\n"
+prompt = "Audit this medical question set (FCPS Part 1). Focus ONLY on factual accuracy.\n\n"
 
 for i, q in enumerate(questions):
-    # Format options cleanly for AI
     opts_str = ", ".join([f"{o['key']}:{o['text']}" for o in q.options])
-    
     prompt += f"--- QUESTION ID {q.question_id} ---\n"
-    prompt += f"Stem: {q.stem}\n"
-    prompt += f"Options: {opts_str}\n"
-    prompt += f"Correct Key: {q.correct_key}\n"
-    prompt += f"Explanation: {q.explanation}\n\n"
+    prompt += f"Stem: {q.stem}\nOptions: {opts_str}\nKey: {q.correct_key}\nExpl: {q.explanation}\n\n"
 
 prompt += """
 Check for: 
 1. Factually incorrect medical statements.
 2. Wrong Answer Key (e.g. Explanation says A but Key says B).
 3. Two correct options.
+4. Any other inaccuracies.
+Response Pattern:
+1. If ALL questions are correct, global_verdict = "PASS".
+2. If ANY question has a factual error, global_verdict = "FAIL".
+3. Only provide feedback for specific questions that have errors.
 
 OUTPUT JSON FORMAT:
 {
+    "global_verdict": "PASS" or "FAIL",
+    "global_summary": "Short note if FAIL, null if PASS",
     "evaluations": [
-        { "question_id": 123, "status": "PASS", "feedback": null },
-        { "question_id": 456, "status": "FAIL", "feedback": "Explanation contradicts key." }
+        { "question_id": 123, "status": "FAIL", "feedback": "Wrong dose." },
+        { "question_id": 456, "status": "PASS", "feedback": null }
     ]
 }
 """
 
 try:
-    # Call Gemini with Structured Output
     response = client.models.generate_content(
         model='gemini-3-flash-preview',
         contents=prompt,
@@ -322,26 +329,18 @@ try:
             'response_schema': AuditResponse,
         }
     )
-    
     res: AuditResponse = response.parsed
     
-    # INJECT RESULTS BACK INTO UI
-    for evaluation in res.evaluations:
-        qid = evaluation.question_id
-        
-        # 1. Update Icon
-        if qid in ai_status_icons:
-            if evaluation.status == "PASS":
-                ai_status_icons[qid].write("✅")
-            else:
-                ai_status_icons[qid].write("❌")
-        
-        # 2. Show Error Message (Only if Fail)
-        if evaluation.status == "FAIL" and evaluation.feedback:
-            if qid in ai_feedback_boxes:
-                ai_feedback_boxes[qid].error(f"**AI:** {evaluation.feedback}")
+    # 1. Update Global Header
+    if res.global_verdict == "PASS":
+        global_verdict_container.success("✅ **AI VERDICT: PASS** (Medical Logic Verified)")
+    else:
+        global_verdict_container.error(f"❌ **AI VERDICT: FAIL** - {res.global_summary}")
+
+    # 2. Update Specific Cards (Only if Fail)
+    for ev in res.evaluations:
+        if ev.status == "FAIL" and ev.question_id in question_feedback_map:
+            question_feedback_map[ev.question_id].error(f"**AI Error Detected:** {ev.feedback}")
 
 except Exception as e:
-    # Fail gracefully
-    for q in questions:
-        ai_status_icons[q.question_id].write("⚠️")
+    global_verdict_container.warning("⚠️ AI Audit Failed to Connect (Check API Key)")
