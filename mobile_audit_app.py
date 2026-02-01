@@ -29,7 +29,7 @@ st.markdown("""
     .element-container { margin-bottom: 1rem; }
     
     .explanation-text {
-        color: #444; 
+        color: #fff; 
         font-size: 0.95em; 
         line-height: 1.5;
     }
