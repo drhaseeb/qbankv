@@ -1,55 +1,69 @@
 import streamlit as st
 import pg8000.native
 import ssl
+import json
 import os
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 from pydantic import BaseModel
-from google import genai # <--- NEW SDK
+from google import genai
 
 # ==============================================================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & STYLING
 # ==============================================================================
+st.set_page_config(page_title="FCPS Auditor", layout="centered", page_icon="🩺")
+
+# CUSTOM CSS: Fixes button alignment, colors, and spacing
+st.markdown("""
+<style>
+    /* Make buttons fill their columns and align perfectly */
+    div.stButton > button {
+        width: 100%;
+        border-radius: 8px;
+        height: 38px;
+        border: 1px solid #e0e0e0;
+        font-weight: 500;
+    }
+    
+    /* Primary Action Button (Verify) */
+    div.stButton > button[kind="primary"] {
+        background-color: #0f9d58; 
+        border-color: #0f9d58;
+    }
+
+    /* Card-like look for expanders */
+    .streamlit-expanderHeader {
+        background-color: #f8f9fa;
+        border-radius: 8px;
+    }
+    
+    /* Clean status badges */
+    .status-badge {
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 0.8em;
+        font-weight: bold;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 DB_HOST = os.getenv("DB_HOST", "psql-qbank-core-01.postgres.database.azure.com")
 DB_USER = os.getenv("DB_USER", "rmhadmin")
 DB_NAME = os.getenv("DB_NAME", "postgres")
 DB_PORT = 5432
 
-# Initialize New Client
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ==============================================================================
-# 2. PYDANTIC MODELS (For Structured Output)
+# 2. DATA MODELS
 # ==============================================================================
 class QuestionAudit(BaseModel):
-    index: int
-    status: str  # "PASS" or "FAIL"
+    question_id: int  # Mapping back by ID is safer than Index
+    status: str       # "PASS" or "FAIL"
     feedback: Optional[str] = None
 
 class AuditResponse(BaseModel):
     evaluations: List[QuestionAudit]
-
-# ==============================================================================
-# 3. DATABASE LOGIC
-# ==============================================================================
-def get_db():
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-    # Use session password
-    return pg8000.native.Connection(
-        user=DB_USER, host=DB_HOST, password=st.session_state["db_password"], 
-        database=DB_NAME, port=DB_PORT, ssl_context=ssl_ctx
-    )
-
-def try_connect(password):
-    try:
-        st.session_state["db_password"] = password # Temp store to test
-        conn = get_db()
-        conn.close()
-        return True, None
-    except Exception as e:
-        return False, str(e)
 
 @dataclass
 class QuestionData:
@@ -62,9 +76,29 @@ class QuestionData:
     role: str
     status: str
 
+# ==============================================================================
+# 3. DATABASE LOGIC
+# ==============================================================================
+def get_db():
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    return pg8000.native.Connection(
+        user=DB_USER, host=DB_HOST, password=st.session_state["db_password"], 
+        database=DB_NAME, port=DB_PORT, ssl_context=ssl_ctx
+    )
+
+def try_connect(password):
+    try:
+        st.session_state["db_password"] = password
+        conn = get_db()
+        conn.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
 def fetch_variant_group():
     conn = get_db()
-    # Find unverified group
     group_query = "SELECT DISTINCT variant_group_id FROM question_bank WHERE status != 'verified' LIMIT 1"
     group_row = conn.run(group_query)
     
@@ -108,17 +142,13 @@ def mark_group_verified(group_id):
     conn.run("UPDATE question_bank SET status = 'verified' WHERE variant_group_id = :gid", gid=group_id)
     conn.close()
 
-import json # Need standard json for DB writes
-
 # ==============================================================================
-# 4. APP START & LOGIN
+# 4. LOGIN SCREEN
 # ==============================================================================
-st.set_page_config(page_title="FCPS Live Audit", layout="centered")
-
 if not st.session_state.get("authenticated", False):
-    st.markdown("## 🔐 Database Login")
+    st.markdown("### 🔐 Login")
     pwd = st.text_input("Database Password", type="password")
-    if st.button("Login"):
+    if st.button("Connect"):
         valid, err = try_connect(pwd)
         if valid:
             st.session_state["authenticated"] = True
@@ -128,149 +158,190 @@ if not st.session_state.get("authenticated", False):
     st.stop()
 
 # ==============================================================================
-# 5. UI & INJECTION LOGIC
+# 5. MAIN UI & PLACEHOLDER LOGIC
 # ==============================================================================
 if 'group_data' not in st.session_state:
     st.session_state.group_data = fetch_variant_group()
-    # We do NOT store audit_result in session state anymore because 
-    # we want to re-run it fresh if data changes, but we check cache inside function
 
 group_id, questions = st.session_state.group_data
 
-# Toolbar
-with st.container():
-    c1, c2 = st.columns([0.8, 0.2])
-    c1.progress(100, text=f"Group: {group_id}")
-    if c2.button("🔄"):
+# Top Bar
+c1, c2 = st.columns([0.85, 0.15])
+with c1:
+    st.caption(f"Reviewing Variant Group: {group_id}")
+    st.progress(100)
+with c2:
+    if st.button("🔄", help="Refresh Data"):
         st.cache_data.clear()
         st.session_state.group_data = fetch_variant_group()
         st.rerun()
 
 if not group_id:
-    st.success("🎉 All caught up!")
+    st.balloons()
+    st.success("You are all caught up! No unverified questions found.")
     st.stop()
 
-# --- DICTIONARY TO HOLD PLACEHOLDERS ---
-# This is the magic. We create empty slots now, and fill them later.
-audit_placeholders = {} 
+# --- PLACEHOLDER REGISTRY ---
+# We store widgets here to update them later with AI results
+ai_status_icons = {}
+ai_feedback_boxes = {}
 
-for i, q in enumerate(questions):
+# --- RENDER QUESTIONS LOOP ---
+for q in questions:
     
+    # CARD CONTAINER
     with st.container(border=True):
-        # Header Line
-        h1, h2, h3 = st.columns([0.6, 0.2, 0.2])
-        h1.markdown(f"**{q.role}**: {q.variant_type}")
         
-        stat_color = "green" if q.status == 'active' else "red"
-        h2.markdown(f":{stat_color}[{q.status}]")
+        # 1. HEADER ROW (Role | Status | AI Spinner)
+        h1, h2, h3 = st.columns([0.6, 0.25, 0.15])
         
-        # --- CREATE PLACEHOLDER FOR AI ICON ---
-        # We save this specific object to write to it later
-        audit_placeholders[i+1] = h3.empty()
-        audit_placeholders[i+1].write("⏳") 
+        with h1:
+            # Clean Role Badge
+            icon = "🔹" if q.role == "Primary" else "🔗"
+            st.markdown(f"**{icon} {q.role}**")
+            st.caption(f"{q.variant_type}")
 
-        # --- CREATE PLACEHOLDER FOR FEEDBACK TEXT ---
-        # Only used if AI fails
-        feedback_placeholder = st.empty()
-        audit_placeholders[f"fb_{i+1}"] = feedback_placeholder
+        with h2:
+            # Status Badge
+            if q.status == 'active':
+                st.markdown('<span style="color:green; background:#e6f4ea; padding:2px 6px; border-radius:4px;">ACTIVE</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span style="color:red; background:#fce8e6; padding:2px 6px; border-radius:4px;">INACTIVE</span>', unsafe_allow_html=True)
 
-        # --- READ/EDIT UI ---
+        with h3:
+            # AI Placeholders
+            ai_status_icons[q.question_id] = st.empty()
+            ai_status_icons[q.question_id].write("⏳") # Loading state
+
+        # 2. FEEDBACK ROW (Hidden unless fail)
+        ai_feedback_boxes[q.question_id] = st.empty()
+
+        # 3. CONTENT AREA
         edit_key = f"edit_mode_{q.question_id}"
+        
         if st.session_state.get(edit_key, False):
-            new_stem = st.text_area("Stem", q.stem, key=f"s_{q.question_id}")
-            new_expl = st.text_area("Explanation", q.explanation, key=f"e_{q.question_id}")
-            new_key = st.selectbox("Key", ["A","B","C","D","E"], index=["A","B","C","D","E"].index(q.correct_key), key=f"k_{q.question_id}")
+            # === EDIT MODE ===
+            new_stem = st.text_area("Vignette", q.stem, height=100)
+            new_key = st.selectbox("Correct Option", ["A","B","C","D","E"], 
+                                   index=["A","B","C","D","E"].index(q.correct_key),
+                                   key=f"k_{q.question_id}")
+            new_expl = st.text_area("Explanation", q.explanation)
             
-            if st.button("💾 Save", key=f"sv_{q.question_id}"):
+            b1, b2 = st.columns(2)
+            if b1.button("💾 Save Changes", key=f"sv_{q.question_id}", type="primary"):
                 new_json = {"stem": new_stem, "options": q.options, "correct_key": new_key}
                 save_edit(q.question_id, new_json, new_expl)
                 st.session_state[edit_key] = False
                 st.rerun()
+            if b2.button("Cancel", key=f"cn_{q.question_id}"):
+                st.session_state[edit_key] = False
+                st.rerun()
+                
         else:
+            # === READ MODE ===
             st.write(q.stem)
-            st.markdown("---")
-            for opt in q.options:
-                if opt['key'] == q.correct_key:
-                    st.markdown(f":green[**{opt['key']}) {opt['text']}**]  *(Correct)*")
-                else:
-                    st.markdown(f"{opt['key']}) {opt['text']}")
-            st.markdown("---")
-            with st.expander("Explanation"):
-                st.info(q.explanation)
             
-            # Action Buttons
-            b1, b2 = st.columns(2)
-            if b1.button("✏️ Edit", key=f"ed_{q.question_id}"):
+            # Options Display (Compact)
+            opt_md = ""
+            for opt in q.options:
+                key = opt['key']
+                text = opt['text']
+                if key == q.correct_key:
+                    opt_md += f"- :green[**{key}) {text}**] (Key)\n"
+                else:
+                    opt_md += f"- {key}) {text}\n"
+            st.markdown(opt_md)
+            
+            # Explanation (Collapsible)
+            with st.expander("Show Explanation"):
+                st.info(q.explanation)
+
+            # Footer Actions
+            f1, f2 = st.columns(2)
+            if f1.button("✏️ Edit", key=f"ed_{q.question_id}"):
                 st.session_state[edit_key] = True
                 st.rerun()
             
-            t_label = "Disable 🚫" if q.status == 'active' else "Enable ✅"
-            t_val = 'inactive' if q.status == 'active' else 'active'
-            if b2.button(t_label, key=f"tg_{q.question_id}"):
-                update_status_single(q.question_id, t_val)
+            tog_label = "Deactivate 🚫" if q.status == 'active' else "Activate ✅"
+            if f2.button(tog_label, key=f"tg_{q.question_id}"):
+                new_s = 'inactive' if q.status == 'active' else 'active'
+                update_status_single(q.question_id, new_s)
                 st.rerun()
 
-# Footer
+# --- BOTTOM ACTION BAR ---
 st.divider()
-fc1, fc2 = st.columns(2)
-if fc1.button("⏭️ Skip"):
+ac1, ac2 = st.columns(2)
+
+if ac1.button("⏭️ Skip Group"):
     st.session_state.group_data = fetch_variant_group()
     st.rerun()
-if fc2.button("✅ Verify All", type="primary"):
+
+if ac2.button("✅ Verify All", type="primary"):
     mark_group_verified(group_id)
-    st.toast("Saved!")
+    st.toast("Marked as Verified!")
     st.session_state.group_data = fetch_variant_group()
     st.rerun()
 
 # ==============================================================================
-# 6. INJECTION ENGINE (Runs at the end)
+# 6. AI INJECTION (Runs automatically at end of script)
 # ==============================================================================
-# This runs AFTER the UI is drawn. It will "fill in" the placeholders.
-
-prompt = "Audit these medical questions (FCPS Part 1). Focus on factual accuracy of the Stem, the Options, the Key and the Explanation.\n\n"
+prompt = "Audit these medical questions (FCPS Part 1). Focus ONLY on factual errors.\n\n"
 
 for i, q in enumerate(questions):
-    # 1. Format the options into a clean string
-    # e.g., "A) Aspirin\nB) Paracetamol..."
-    opts_str = "\n".join([f"{opt['key']}) {opt['text']}" for opt in q.options])
+    # Format options cleanly for AI
+    opts_str = ", ".join([f"{o['key']}:{o['text']}" for o in q.options])
     
-    # 2. Build the readable block
-    prompt += f"--- QUESTION {i+1} ({q.role}: {q.variant_type}) ---\n"
+    prompt += f"--- QUESTION ID {q.question_id} ---\n"
     prompt += f"Stem: {q.stem}\n"
-    prompt += f"Options:\n{opts_str}\n"        # <--- Clean options list
-    prompt += f"Correct Answer: {q.correct_key}\n" # <--- Clear label
+    prompt += f"Options: {opts_str}\n"
+    prompt += f"Correct Key: {q.correct_key}\n"
     prompt += f"Explanation: {q.explanation}\n\n"
 
-# Using the new Google GenAI SDK with Structured Output
+prompt += """
+Check for: 
+1. Factually incorrect medical statements.
+2. Wrong Answer Key (e.g. Explanation says A but Key says B).
+3. Two correct options.
+
+OUTPUT JSON FORMAT:
+{
+    "evaluations": [
+        { "question_id": 123, "status": "PASS", "feedback": null },
+        { "question_id": 456, "status": "FAIL", "feedback": "Explanation contradicts key." }
+    ]
+}
+"""
+
 try:
+    # Call Gemini with Structured Output
     response = client.models.generate_content(
         model='gemini-3-flash-preview',
         contents=prompt,
         config={
             'response_mime_type': 'application/json',
-            'response_schema': AuditResponse, # Pydantic Model!
+            'response_schema': AuditResponse,
         }
     )
     
-    # Parse the Pydantic object directly
-    result: AuditResponse = response.parsed
+    res: AuditResponse = response.parsed
     
-    # Inject Results!
-    for evaluation in result.evaluations:
-        idx = evaluation.index
+    # INJECT RESULTS BACK INTO UI
+    for evaluation in res.evaluations:
+        qid = evaluation.question_id
         
         # 1. Update Icon
-        if evaluation.status == "PASS":
-            audit_placeholders[idx].write("✅")
-        else:
-            audit_placeholders[idx].write("❌")
-            
-        # 2. Update Feedback (Only if Fail)
+        if qid in ai_status_icons:
+            if evaluation.status == "PASS":
+                ai_status_icons[qid].write("✅")
+            else:
+                ai_status_icons[qid].write("❌")
+        
+        # 2. Show Error Message (Only if Fail)
         if evaluation.status == "FAIL" and evaluation.feedback:
-            audit_placeholders[f"fb_{idx}"].error(f"AI: {evaluation.feedback}")
+            if qid in ai_feedback_boxes:
+                ai_feedback_boxes[qid].error(f"**AI:** {evaluation.feedback}")
 
 except Exception as e:
-    # If AI fails, turn all hourglasses to warning signs
-    for i in range(len(questions)):
-        audit_placeholders[i+1].write("⚠️")
-        audit_placeholders[f"fb_{i+1}"].caption(f"AI Error: {str(e)}")
+    # Fail gracefully
+    for q in questions:
+        ai_status_icons[q.question_id].write("⚠️")
