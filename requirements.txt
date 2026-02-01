@@ -1,3 +1,4 @@
 streamlit
 pg8000
-google-generativeai
+google-genai
+pydantic
