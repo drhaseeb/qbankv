@@ -5,28 +5,26 @@ import json
 import google.generativeai as genai
 from dataclasses import dataclass
 from typing import List, Dict
+import os
 
 # ==============================================================================
 # 1. CONFIGURATION
 # ==============================================================================
-# Replace with actual credentials or use st.secrets
 DB_CONFIG = {
-    "host": "psql-qbank-core-01.postgres.database.azure.com",
-    "user": "rmhadmin",
-    "password": "Password",
-    "database": "postgres",
+    "host": os.getenv("DB_HOST", "psql-qbank-core-01.postgres.database.azure.com"),
+    "user": os.getenv("DB_USER", "rmhadmin"),
+    "password": os.getenv("DB_PASS", "YOUR_DB_PASSWORD"), 
+    "database": os.getenv("DB_NAME", "postgres"),
     "port": 5432
 }
-GOOGLE_API_KEY = "Key"
-
-genai.configure(api_key=GOOGLE_API_KEY)
+genai.configure(api_key=os.getenv("GEMINI_API_KEY", "YOUR_API_KEY"))
 
 # ==============================================================================
-# 2. DATABASE & DATA MODELS
+# 2. DATA MODELS
 # ==============================================================================
 @dataclass
 class QuestionData:
-    id: int
+    question_id: int # <--- RENAMED TO MATCH DB
     stem: str
     options: List[Dict]
     correct_key: str
@@ -41,221 +39,209 @@ def get_db():
     ssl_ctx.verify_mode = ssl.CERT_NONE
     return pg8000.native.Connection(**DB_CONFIG, ssl_context=ssl_ctx)
 
-def fetch_concept_cluster():
-    """Fetches a Primary question and its Clones to review as a single concept."""
+def fetch_variant_group():
+    """Fetches ALL questions belonging to a single unverified Variant Group."""
     conn = get_db()
-    # Fetch a random Primary question that hasn't been 'verified' yet
-    primary_row = conn.run("""
-        SELECT id, question_json, explanation, variant_type, variant_group_id, role, status
+    
+    # 1. Find a Variant Group ID that needs work (is not fully verified)
+    group_query = """
+        SELECT DISTINCT variant_group_id 
         FROM question_bank 
-        WHERE role = 'Primary' AND status != 'verified' 
-        ORDER BY created_at DESC 
+        WHERE status != 'verified' 
         LIMIT 1
-    """)
+    """
+    group_row = conn.run(group_query)
     
-    if not primary_row:
+    if not group_row:
         conn.close()
-        return None, None
+        return None, []
 
-    pid, p_json_str, p_expl, p_var, group_id, p_role, p_stat = primary_row[0]
-    p_json = json.loads(p_json_str) if isinstance(p_json_str, str) else p_json_str
-    
-    primary_q = QuestionData(pid, p_json['stem'], p_json['options'], p_json['correct_key'], p_expl, p_var, p_role, p_stat)
+    target_group_id = group_row[0][0]
 
-    # Fetch Clones
-    clones_rows = conn.run("""
-        SELECT id, question_json, explanation, variant_type, role, status
+    # 2. Fetch ALL questions in this group (Primaries AND Clones together)
+    # FIX: Using 'question_id' instead of 'id'
+    questions_query = """
+        SELECT question_id, question_json, explanation, variant_type, role, status
         FROM question_bank 
-        WHERE variant_group_id = :gid AND role != 'Primary'
-    """, gid=group_id)
+        WHERE variant_group_id = :gid
+        ORDER BY question_id ASC
+    """
+    rows = conn.run(questions_query, gid=target_group_id)
     
-    clones = []
-    for row in clones_rows:
-        cid, c_json_str, c_expl, c_var, c_role, c_stat = row
-        c_json = json.loads(c_json_str) if isinstance(c_json_str, str) else c_json_str
-        clones.append(QuestionData(cid, c_json['stem'], c_json['options'], c_json['correct_key'], c_expl, c_var, c_role, c_stat))
+    questions = []
+    for row in rows:
+        qid, q_json_str, q_expl, q_var, q_role, q_stat = row
+        q_json = json.loads(q_json_str) if isinstance(q_json_str, str) else q_json_str
+        
+        q_obj = QuestionData(
+            question_id=qid, # <--- Mapping DB column to Object
+            stem=q_json['stem'],
+            options=q_json['options'],
+            correct_key=q_json['correct_key'],
+            explanation=q_expl,
+            variant_type=q_var,
+            role=q_role,
+            status=q_stat
+        )
+        questions.append(q_obj)
 
     conn.close()
-    return primary_q, clones
+    return target_group_id, questions
 
-def update_question_status(q_id, new_status):
+def save_edit(qid, new_json, new_expl):
     conn = get_db()
-    conn.run("UPDATE question_bank SET status = :s WHERE id = :id", s=new_status, id=q_id)
+    # FIX: Using 'question_id'
+    conn.run("UPDATE question_bank SET question_json = :qj, explanation = :ex WHERE question_id = :qid", 
+             qj=json.dumps(new_json), ex=new_expl, qid=qid)
     conn.close()
 
-def save_edit(q_id, new_json, new_expl):
+def update_status_single(qid, new_status):
     conn = get_db()
-    conn.run("UPDATE question_bank SET question_json = :qj, explanation = :ex WHERE id = :id", 
-             qj=json.dumps(new_json), ex=new_expl, id=q_id)
+    # FIX: Using 'question_id'
+    conn.run("UPDATE question_bank SET status = :s WHERE question_id = :qid", s=new_status, qid=qid)
+    conn.close()
+
+def mark_group_verified(group_id):
+    conn = get_db()
+    # Group logic remains same (updates all questions with this Group ID)
+    conn.run("UPDATE question_bank SET status = 'verified' WHERE variant_group_id = :gid", gid=group_id)
     conn.close()
 
 # ==============================================================================
-# 3. AI VERIFICATION ENGINE
+# 3. AI AUDIT ENGINE
 # ==============================================================================
-def run_auto_verification(primary: QuestionData, clones: List[QuestionData]):
-    """Sends content to Gemini Flash for a truth audit."""
+def audit_group_with_gemini(questions: List[QuestionData]):
     model = genai.GenerativeModel('gemini-3-flash-preview')
     
-    content_block = f"PRIMARY CONCEPT ({primary.variant_type}):\n{primary.stem}\nAnswer: {primary.correct_key}\nExplanation: {primary.explanation}\n\n"
-    for i, c in enumerate(clones):
-        content_block += f"VARIANT {i+1} ({c.variant_type}):\n{c.stem}\nAnswer: {c.correct_key}\nExplanation: {c.explanation}\n\n"
+    prompt = "You are a Medical Examiner auditing FCPS Part 1 questions. Review this SET of related questions.\n\n"
+    
+    for i, q in enumerate(questions):
+        prompt += f"--- QUESTION {i+1} ({q.role}: {q.variant_type}) ---\n"
+        prompt += f"ID: {q.question_id}\nStem: {q.stem}\nKey: {q.correct_key}\nExplanation: {q.explanation}\n\n"
 
-    prompt = f"""
-    Act as a Strict Medical Examiner for FCPS Part 1. 
-    Audit the following medical concept cluster (a primary question and its variations) for factual accuracy and logic.
-
-    {content_block}
-
-    OUTPUT IN JSON ONLY:
-    {{
-        "verdict": "ACCURATE" or "INACCURATE",
-        "confidence_score": 0-100,
-        "summary": "Brief summary of accuracy. (only if inaccurate)",
-        "mistakes": [
-            "List specific errors found here. If none, leave empty."
+    prompt += """
+    TASK: Verify medical accuracy for EACH question.
+    
+    OUTPUT JSON FORMAT:
+    {
+        "overall_verdict": "PASS" or "FAIL",
+        "summary": "Brief summary of the group's quality.",
+        "evaluations": [
+            {"index": 1, "status": "PASS", "feedback": "Correct."},
+            {"index": 2, "status": "FAIL", "feedback": "Incorrect dose mentioned."}
         ]
-    }}
+    }
     """
+    
     try:
-        response = model.generate_content(prompt)
-        text = response.text.replace("```json", "").replace("```", "").strip()
+        res = model.generate_content(prompt)
+        text = res.text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except:
-        return {"verdict": "ERROR", "summary": "AI connection failed.", "mistakes": []}
+        return {"overall_verdict": "ERROR", "summary": "AI Failed", "evaluations": []}
 
 # ==============================================================================
-# 4. UI COMPONENTS
+# 4. APP UI
 # ==============================================================================
-def render_question_card(q: QuestionData, idx: str):
-    """Displays a single question block with Edit/Status controls."""
-    with st.container(border=True):
-        # Header
-        col1, col2 = st.columns([0.8, 0.2])
-        with col1:
-            st.markdown(f"**{q.role}**: {q.variant_type}")
-        with col2:
-            # Status Indicator
-            color = "green" if q.status == 'active' else "red"
-            st.markdown(f":{color}[{q.status.upper()}]")
+st.set_page_config(page_title="FCPS Group Audit", layout="centered")
 
-        # Read Mode vs Edit Mode
-        if st.session_state.get(f"edit_{q.id}", False):
-            # --- EDIT MODE ---
-            new_stem = st.text_area("Stem", q.stem, key=f"stem_{q.id}")
-            new_expl = st.text_area("Explanation", q.explanation, key=f"expl_{q.id}")
-            
-            # Simple Key Editor
-            new_key = st.selectbox("Correct Key", ["A","B","C","D","E"], 
-                                   index=["A","B","C","D","E"].index(q.correct_key), 
-                                   key=f"key_{q.id}")
-            
-            c1, c2 = st.columns(2)
-            if c1.button("💾 Save", key=f"save_{q.id}"):
-                # Reconstruct JSON with new stem/key (options editing omitted for brevity but can be added)
-                new_q_json = {"stem": new_stem, "options": q.options, "correct_key": new_key}
-                save_edit(q.id, new_q_json, new_expl)
-                st.session_state[f"edit_{q.id}"] = False
-                st.rerun()
-            
-            if c2.button("Cancel", key=f"cancel_{q.id}"):
-                st.session_state[f"edit_{q.id}"] = False
-                st.rerun()
-        else:
-            # --- READ MODE ---
-            st.write(q.stem)
-            
-            # Show Options
-            for opt in q.options:
-                prefix = "✅" if opt['key'] == q.correct_key else "⚪"
-                st.text(f"{prefix} {opt['key']}) {opt['text']}")
-            
-            st.info(f"**Explanation:** {q.explanation}")
-            
-            # Toolbar
-            btn_col1, btn_col2 = st.columns(2)
-            if btn_col1.button("✏️ Edit", key=f"btn_edit_{q.id}"):
-                st.session_state[f"edit_{q.id}"] = True
-                st.rerun()
-            
-            # Toggle Active/Inactive
-            btn_label = "Deactivate 🚫" if q.status == 'active' else "Activate ✅"
-            new_stat = 'inactive' if q.status == 'active' else 'active'
-            if btn_col2.button(btn_label, key=f"btn_stat_{q.id}"):
-                update_question_status(q.id, new_stat)
-                st.rerun()
+if 'group_data' not in st.session_state:
+    st.session_state.group_data = fetch_variant_group()
+    st.session_state.audit_result = None
 
-# ==============================================================================
-# 5. MAIN APP LOGIC
-# ==============================================================================
-st.set_page_config(page_title="FCPS Auto-Audit", layout="centered", page_icon="⚡")
+group_id, questions = st.session_state.group_data
 
-# 1. Load Data
-if 'audit_data' not in st.session_state:
-    st.session_state.audit_data = fetch_concept_cluster()
-    st.session_state.ai_audit_result = None
-
-primary, clones = st.session_state.audit_data
-
-if not primary:
-    st.success("✅ No pending questions found!")
-    if st.button("Reload"):
+if not group_id:
+    st.success("🎉 Database is clean! No unverified groups found.")
+    if st.button("Refresh"):
         st.cache_data.clear()
-        st.session_state.audit_data = fetch_concept_cluster()
+        st.session_state.group_data = fetch_variant_group()
         st.rerun()
 else:
-    # 2. Trigger Auto-Verification (Once per load)
-    if st.session_state.ai_audit_result is None:
-        with st.spinner("🤖 Gemini is auditing this concept..."):
-            st.session_state.ai_audit_result = run_auto_verification(primary, clones)
+    # --- AUTO AUDIT (ON LOAD) ---
+    if st.session_state.audit_result is None:
+        with st.spinner("🤖 Auditing Concept Cluster..."):
+            st.session_state.audit_result = audit_group_with_gemini(questions)
 
-    # 3. Display Content
-    st.title("⚡ Rapid Review")
+    # --- TOP BAR ---
+    st.progress(100, text=f"Reviewing Group: {group_id}")
     
-    # Render Questions
-    render_question_card(primary, "p")
-    for i, c in enumerate(clones):
-        render_question_card(c, str(i))
-
-    # 4. Display AI Verdict (Sticky Bottom or End of Page)
-    st.divider()
-    audit = st.session_state.ai_audit_result
-    
+    audit = st.session_state.audit_result
     if audit:
-        # Determine Color
-        if audit.get("verdict") == "ACCURATE":
-            box_color = "green"
-            icon = "✅"
-        else:
-            box_color = "red"
-            icon = "⚠️"
-            
-        st.subheader(f"{icon} AI Verdict: {audit.get('verdict')}")
-        st.write(f"**Summary:** {audit.get('summary')}")
+        color = "green" if audit.get("overall_verdict") == "PASS" else "red"
+        st.markdown(f":{color}-background[**AI Verdict: {audit.get('overall_verdict')}**]")
+        st.caption(audit.get("summary"))
+
+    # --- RENDER QUESTIONS LIST ---
+    for i, q in enumerate(questions):
         
-        if audit.get("mistakes"):
-            st.error("🚨 **Detected Issues:**")
-            for m in audit["mistakes"]:
-                st.write(f"- {m}")
+        # Get specific AI feedback
+        evals = audit.get("evaluations", [])
+        q_feedback = next((e for e in evals if e.get("index") == i + 1), {})
+        ai_stat = q_feedback.get("status", "Unknown")
+        ai_note = q_feedback.get("feedback", "")
+        
+        # UI Card
+        with st.container(border=True):
+            # Header Row
+            c1, c2, c3 = st.columns([0.6, 0.2, 0.2])
+            with c1:
+                icon = "🔹" if q.role == "Primary" else "Zw"
+                st.markdown(f"**{icon} {q.role}** ({q.variant_type})")
+            with c2:
+                scolor = "green" if q.status == 'active' else "red"
+                st.markdown(f":{scolor}[{q.status}]")
+            with c3:
+                aicolor = "✅" if ai_stat == "PASS" else "❌"
+                st.write(aicolor)
+
+            if ai_stat == "FAIL":
+                st.error(f"AI: {ai_note}")
+
+            # Editable Area Check
+            edit_key = f"edit_mode_{q.question_id}"
+            
+            if st.session_state.get(edit_key, False):
+                # EDIT MODE
+                new_stem = st.text_area("Stem", q.stem, key=f"s_{q.question_id}")
+                new_expl = st.text_area("Explanation", q.explanation, key=f"e_{q.question_id}")
+                new_key = st.selectbox("Key", ["A","B","C","D","E"], index=["A","B","C","D","E"].index(q.correct_key), key=f"k_{q.question_id}")
+                
+                if st.button("💾 Save", key=f"btn_save_{q.question_id}"):
+                    new_json = {"stem": new_stem, "options": q.options, "correct_key": new_key}
+                    save_edit(q.question_id, new_json, new_expl)
+                    st.session_state[edit_key] = False
+                    st.rerun()
+            else:
+                # READ MODE
+                st.write(q.stem)
+                with st.expander(f"Answer: {q.correct_key} (Click to see Explanation)"):
+                    st.info(q.explanation)
+                
+                # Tools
+                b1, b2 = st.columns(2)
+                if b1.button("✏️ Edit", key=f"ed_{q.question_id}"):
+                    st.session_state[edit_key] = True
+                    st.rerun()
+                
+                toggle_label = "Deactivate" if q.status == 'active' else "Activate"
+                if b2.button(toggle_label, key=f"tog_{q.question_id}"):
+                    new_s = 'inactive' if q.status == 'active' else 'active'
+                    update_status_single(q.question_id, new_s)
+                    st.rerun()
+
+    # --- FOOTER ACTIONS ---
+    st.divider()
+    fc1, fc2 = st.columns(2)
     
-    # 5. Final Actions
-    st.markdown("---")
-    c1, c2 = st.columns(2)
-    
-    if c1.button("⏭️ Next Concept (Keep Pending)", use_container_width=True):
-        # Just move on, don't mark verified
-        st.session_state.ai_audit_result = None
-        st.session_state.audit_data = fetch_concept_cluster()
+    if fc1.button("⏭️ Skip (Keep Pending)"):
+        st.session_state.audit_result = None
+        st.session_state.group_data = fetch_variant_group()
         st.rerun()
         
-    if c2.button("✅ Verify All & Next", type="primary", use_container_width=True):
-        # Mark all as verified
-        conn = get_db()
-        ids = [primary.id] + [c.id for c in clones]
-        for i in ids:
-            conn.run("UPDATE question_bank SET status = 'verified' WHERE id = :id", id=i)
-        conn.close()
-        
-        st.toast("Verified!")
-        st.session_state.ai_audit_result = None
-        st.session_state.audit_data = fetch_concept_cluster()
+    if fc2.button("✅ Approve Group", type="primary"):
+        mark_group_verified(group_id)
+        st.toast("Group Verified!")
+        st.session_state.audit_result = None
+        st.session_state.group_data = fetch_variant_group()
         st.rerun()
