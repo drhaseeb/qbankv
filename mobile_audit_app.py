@@ -8,16 +8,93 @@ from typing import List, Dict
 import os
 
 # ==============================================================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION (No Password Here!)
 # ==============================================================================
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "psql-qbank-core-01.postgres.database.azure.com"),
-    "user": os.getenv("DB_USER", "rmhadmin"),
-    "password": os.getenv("DB_PASS", "YOUR_DB_PASSWORD"), 
-    "database": os.getenv("DB_NAME", "postgres"),
-    "port": 5432
-}
+# We only store non-sensitive connection details
+DB_HOST = os.getenv("DB_HOST", "psql-qbank-core-01.postgres.database.azure.com")
+DB_USER = os.getenv("DB_USER", "rmhadmin")
+DB_NAME = os.getenv("DB_NAME", "postgres")
+DB_PORT = 5432
+
+# API Key still needs to be in env vars, or you can ask for it in login too
 genai.configure(api_key=os.getenv("GEMINI_API_KEY", "YOUR_API_KEY"))
+
+# ==============================================================================
+# 2. LOGIN & CONNECTION LOGIC
+# ==============================================================================
+def try_connect(password):
+    """Attempts to connect to DB to verify credentials."""
+    try:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        
+        conn = pg8000.native.Connection(
+            user=DB_USER,
+            host=DB_HOST,
+            password=password, # Test the input password
+            database=DB_NAME,
+            port=DB_PORT,
+            ssl_context=ssl_ctx
+        )
+        conn.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def login_screen():
+    """Renders the login form and stops execution if not logged in."""
+    
+    # If we already have a valid password in memory, skip login
+    if st.session_state.get("authenticated", False):
+        return
+
+    st.markdown("## 🔐 Database Login")
+    st.markdown("Enter your PostgreSQL password to unlock the app.")
+    
+    password_input = st.text_input("Database Password", type="password")
+    
+    if st.button("Login"):
+        with st.spinner("Authenticating with Database..."):
+            is_valid, error = try_connect(password_input)
+            
+            if is_valid:
+                st.session_state["db_password"] = password_input
+                st.session_state["authenticated"] = True
+                st.success("✅ Connected!")
+                st.rerun()
+            else:
+                st.error(f"❌ Connection Failed: {error}")
+                
+    # Stop the app here if not authenticated
+    st.stop()
+
+# ==============================================================================
+# 3. DB HELPER (Uses the Session Password)
+# ==============================================================================
+def get_db():
+    """Returns a connection using the password stored in session state."""
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    
+    # CRITICAL: Use the password from the session
+    return pg8000.native.Connection(
+        user=DB_USER,
+        host=DB_HOST,
+        password=st.session_state["db_password"], 
+        database=DB_NAME,
+        port=DB_PORT,
+        ssl_context=ssl_ctx
+    )
+
+# ==============================================================================
+# 🚀 APP START
+# ==============================================================================
+st.set_page_config(page_title="FCPS Secure Audit", layout="centered")
+
+# 1. RUN LOGIN CHECK FIRST
+login_screen()
 
 # ==============================================================================
 # 2. DATA MODELS
@@ -32,12 +109,6 @@ class QuestionData:
     variant_type: str
     role: str
     status: str
-
-def get_db():
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-    return pg8000.native.Connection(**DB_CONFIG, ssl_context=ssl_ctx)
 
 def fetch_variant_group():
     """Fetches ALL questions belonging to a single unverified Variant Group."""
