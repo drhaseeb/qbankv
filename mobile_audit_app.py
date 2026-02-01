@@ -13,11 +13,11 @@ from typing import List, Dict
 DB_CONFIG = {
     "host": "psql-qbank-core-01.postgres.database.azure.com",
     "user": "rmhadmin",
-    "password": "Rimsha*1997#",
+    "password": "Password",
     "database": "postgres",
     "port": 5432
 }
-GOOGLE_API_KEY = "AIzaSyAfYgFuJDRANYng3JFc57OcVmfXnI_VRus"
+GOOGLE_API_KEY = "Key"
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
