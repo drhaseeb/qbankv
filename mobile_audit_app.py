@@ -15,7 +15,6 @@ st.set_page_config(page_title="FCPS Auditor", layout="centered", page_icon="🩺
 
 st.markdown("""
 <style>
-    /* Full width buttons */
     div.stButton > button {
         width: 100%;
         border-radius: 8px;
@@ -27,20 +26,12 @@ st.markdown("""
         background-color: #0f9d58; 
         border-color: #0f9d58;
     }
+    .element-container { margin-bottom: 1rem; }
     
-    /* Clean Card Style */
-    .element-container {
-        margin-bottom: 1rem;
-    }
-    
-    /* Explanation Text Style (Neutral Gray) */
     .explanation-text {
-        background-color: #f8f9fa;
-        padding: 15px;
-        border-radius: 8px;
-        border-left: 4px solid #ced4da;
-        color: #495057;
-        font-size: 0.95em;
+        color: #444; 
+        font-size: 0.95em; 
+        line-height: 1.5;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -53,15 +44,21 @@ DB_PORT = 5432
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ==============================================================================
-# 2. DATA MODELS
+# 2. SESSION & MODELS
 # ==============================================================================
+if "skipped_groups" not in st.session_state:
+    st.session_state["skipped_groups"] = []
+
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
 class QuestionAudit(BaseModel):
     question_id: int
     status: str       # "PASS" or "FAIL"
     feedback: Optional[str] = None
 
 class AuditResponse(BaseModel):
-    global_verdict: str # "PASS" or "FAIL"
+    global_verdict: str
     global_summary: Optional[str] = None
     evaluations: List[QuestionAudit]
 
@@ -74,7 +71,8 @@ class QuestionData:
     explanation: str
     variant_type: str
     role: str
-    status: str
+    status: str             # 'active' or 'inactive'
+    verification_status: str # 'pending' or 'verified'
 
 # ==============================================================================
 # 3. DATABASE LOGIC
@@ -100,23 +98,25 @@ def try_connect(password):
 def fetch_variant_group(skipped_ids):
     conn = get_db()
     
-    # Exclude skipped IDs dynamically
-    exclusion_clause = ""
-    if skipped_ids:
-        # Format list for SQL IN clause safely
-        ids_str = ",".join(map(str, skipped_ids))
-        exclusion_clause = f"AND variant_group_id NOT IN ({ids_str})"
-
-    # Fetch ONE unverified group that hasn't been skipped
-    group_query = f"""
-        SELECT DISTINCT variant_group_id 
-        FROM question_bank 
-        WHERE status != 'verified' 
-        {exclusion_clause}
-        LIMIT 1
-    """
+    # Logic: Find a group where verification_status IS NOT 'verified'
     
-    group_row = conn.run(group_query)
+    if not skipped_ids:
+        group_query = """
+            SELECT DISTINCT variant_group_id 
+            FROM question_bank 
+            WHERE verification_status != 'verified' OR verification_status IS NULL
+            LIMIT 1
+        """
+        group_row = conn.run(group_query)
+    else:
+        group_query = """
+            SELECT DISTINCT variant_group_id 
+            FROM question_bank 
+            WHERE (verification_status != 'verified' OR verification_status IS NULL)
+            AND variant_group_id != ALL(:skip_list)
+            LIMIT 1
+        """
+        group_row = conn.run(group_query, skip_list=skipped_ids)
     
     if not group_row:
         conn.close()
@@ -124,19 +124,24 @@ def fetch_variant_group(skipped_ids):
 
     target_group_id = group_row[0][0]
 
+    # Fetch columns including the new verification_status
     questions_query = """
-        SELECT question_id, question_json, explanation, variant_type, role, status
+        SELECT question_id, question_json, explanation, variant_type, role, status, verification_status
         FROM question_bank WHERE variant_group_id = :gid ORDER BY question_id ASC
     """
     rows = conn.run(questions_query, gid=target_group_id)
     questions = []
     for row in rows:
-        qid, q_json_str, q_expl, q_var, q_role, q_stat = row
+        qid, q_json_str, q_expl, q_var, q_role, q_stat, q_verif = row
         q_json = json.loads(q_json_str) if isinstance(q_json_str, str) else q_json_str
+        
+        # Handle NULL verification status gracefully
+        verif_val = q_verif if q_verif else 'pending'
+        
         questions.append(QuestionData(
             question_id=qid, stem=q_json['stem'], options=q_json['options'],
             correct_key=q_json['correct_key'], explanation=q_expl, variant_type=q_var,
-            role=q_role, status=q_stat
+            role=q_role, status=q_stat, verification_status=verif_val
         ))
     conn.close()
     return target_group_id, questions
@@ -148,26 +153,27 @@ def save_edit(qid, new_json, new_expl):
     conn.close()
 
 def update_status_single(qid, new_status):
+    # Updates Active/Inactive ONLY
     conn = get_db()
     conn.run("UPDATE question_bank SET status = :s WHERE question_id = :qid", s=new_status, qid=qid)
     conn.close()
 
 def mark_group_verified(group_id):
+    # Updates Verification Status ONLY
     conn = get_db()
-    conn.run("UPDATE question_bank SET status = 'verified' WHERE variant_group_id = :gid", gid=group_id)
+    conn.run("UPDATE question_bank SET verification_status = 'verified' WHERE variant_group_id = :gid", gid=group_id)
     conn.close()
 
 # ==============================================================================
 # 4. LOGIN SCREEN
 # ==============================================================================
-if not st.session_state.get("authenticated", False):
+if not st.session_state["authenticated"]:
     st.markdown("### 🔐 Login")
     pwd = st.text_input("Database Password", type="password")
     if st.button("Connect"):
         valid, err = try_connect(pwd)
         if valid:
             st.session_state["authenticated"] = True
-            st.session_state["skipped_groups"] = [] # Init skip list
             st.rerun()
         else:
             st.error(err)
@@ -177,49 +183,51 @@ if not st.session_state.get("authenticated", False):
 # 5. MAIN UI
 # ==============================================================================
 if 'group_data' not in st.session_state:
-    st.session_state.group_data = fetch_variant_group(st.session_state.get("skipped_groups", []))
+    st.session_state.group_data = fetch_variant_group(st.session_state["skipped_groups"])
 
 group_id, questions = st.session_state.group_data
 
-# --- TOP GLOBAL VERDICT PLACEHOLDER ---
-# This sits at the very top. AI will inject "PASS" or "FAIL" here.
+# Global Status Placeholder
 global_verdict_container = st.empty()
-global_verdict_container.info("⏳ AI Audit in progress...")
+global_verdict_container.info("⏳ Auditing...")
 
 if not group_id:
     st.balloons()
-    st.success("All questions reviewed!")
-    if st.button("Reset Skips & Review Again"):
+    st.success("All questions verified!")
+    if st.button("Reset Session"):
         st.session_state["skipped_groups"] = []
         st.cache_data.clear()
         st.session_state.group_data = fetch_variant_group([])
         st.rerun()
     st.stop()
 
-# --- FEEDBACK PLACEHOLDERS MAP ---
-# We track where to put specific error messages
 question_feedback_map = {}
 
 # --- RENDER QUESTIONS ---
 for q in questions:
     
     with st.container(border=True):
-        # Header: Role + Status (No AI Icon)
-        c1, c2 = st.columns([0.8, 0.2])
+        # Header: Role | Active Status | Verification Status
+        c1, c2, c3 = st.columns([0.6, 0.2, 0.2])
         with c1:
             icon = "🔹" if q.role == "Primary" else "🔗"
-            st.markdown(f"**{icon} {q.role}** ({q.variant_type})")
+            st.markdown(f"**{icon} {q.role}**")
+            st.caption(f"{q.variant_type}")
         with c2:
+            # Active/Inactive
             if q.status == 'active':
-                st.caption("✅ ACTIVE")
+                st.markdown('<span style="color:green; font-weight:bold;">ACTIVE</span>', unsafe_allow_html=True)
             else:
-                st.caption("🚫 INACTIVE")
+                st.markdown('<span style="color:red; font-weight:bold;">INACTIVE</span>', unsafe_allow_html=True)
+        with c3:
+            # Verification Badge
+            if q.verification_status == 'verified':
+                st.markdown("✅ Verif")
+            else:
+                st.markdown("⚠️ Pend")
 
-        # ** ERROR MESSAGE PLACEHOLDER **
-        # This remains hidden unless AI finds an error in this specific question
         question_feedback_map[q.question_id] = st.empty()
 
-        # Content
         edit_key = f"edit_{q.question_id}"
         
         if st.session_state.get(edit_key, False):
@@ -243,29 +251,23 @@ for q in questions:
             # === READ MODE ===
             st.write(q.stem)
             
-            # Clean Options List
             for opt in q.options:
-                key, text = opt['key'], opt['text']
-                if key == q.correct_key:
-                    st.markdown(f":green[**{key}) {text}**]")
+                if opt['key'] == q.correct_key:
+                    st.markdown(f":green[**{opt['key']}) {opt['text']}**]")
                 else:
-                    st.markdown(f"{key}) {text}")
+                    st.markdown(f"{opt['key']}) {opt['text']}")
             
-            # Neutral Explanation (No Blue Box)
-            with st.expander("Show Explanation"):
-                st.markdown(f"""
-                <div class="explanation-text">
-                    {q.explanation}
-                </div>
-                """, unsafe_allow_html=True)
+            st.markdown("---")
+            st.markdown("**Explanation**")
+            st.markdown(f"<div class='explanation-text'>{q.explanation}</div>", unsafe_allow_html=True)
 
-            # Toolbar
+            st.markdown("---")
             f1, f2 = st.columns(2)
             if f1.button("✏️ Edit", key=f"ed_{q.question_id}"):
                 st.session_state[edit_key] = True
                 st.rerun()
             
-            tog_text = "Deactivate" if q.status == 'active' else "Activate"
+            tog_text = "Deactivate 🚫" if q.status == 'active' else "Activate ✅"
             if f2.button(tog_text, key=f"tg_{q.question_id}"):
                 new_s = 'inactive' if q.status == 'active' else 'active'
                 update_status_single(q.question_id, new_s)
@@ -276,9 +278,7 @@ st.divider()
 bc1, bc2 = st.columns(2)
 
 if bc1.button("⏭️ Skip Group"):
-    # Add current group to skip list
     st.session_state["skipped_groups"].append(group_id)
-    # Clear current data to force fetch next
     st.session_state.group_data = fetch_variant_group(st.session_state["skipped_groups"])
     st.rerun()
 
@@ -289,7 +289,7 @@ if bc2.button("✅ Verify All", type="primary"):
     st.rerun()
 
 # ==============================================================================
-# 6. AI INJECTION (Runs automatically)
+# 6. AI INJECTION (YOUR CUSTOM PROMPT)
 # ==============================================================================
 prompt = "Audit this medical question set (FCPS Part 1). Focus ONLY on factual accuracy.\n\n"
 
@@ -304,7 +304,8 @@ Check for:
 2. Wrong Answer Key (e.g. Explanation says A but Key says B).
 3. Two correct options.
 4. Any other inaccuracies.
-Response Pattern:
+
+Task:
 1. If ALL questions are correct, global_verdict = "PASS".
 2. If ANY question has a factual error, global_verdict = "FAIL".
 3. Only provide feedback for specific questions that have errors.
@@ -331,16 +332,14 @@ try:
     )
     res: AuditResponse = response.parsed
     
-    # 1. Update Global Header
     if res.global_verdict == "PASS":
-        global_verdict_container.success("✅ **AI VERDICT: PASS** (Medical Logic Verified)")
+        global_verdict_container.success("✅ **AI VERDICT: PASS**")
     else:
         global_verdict_container.error(f"❌ **AI VERDICT: FAIL** - {res.global_summary}")
 
-    # 2. Update Specific Cards (Only if Fail)
     for ev in res.evaluations:
         if ev.status == "FAIL" and ev.question_id in question_feedback_map:
             question_feedback_map[ev.question_id].error(f"**AI Error Detected:** {ev.feedback}")
 
 except Exception as e:
-    global_verdict_container.warning("⚠️ AI Audit Failed to Connect (Check API Key)")
+    global_verdict_container.warning("⚠️ AI Audit Connecting...")
