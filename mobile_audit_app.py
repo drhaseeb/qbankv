@@ -36,9 +36,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-DB_HOST = os.getenv("DB_HOST", "psql-qbank-core-01.postgres.database.azure.com")
-DB_USER = os.getenv("DB_USER", "rmhadmin")
-DB_NAME = os.getenv("DB_NAME", "postgres")
+DB_HOST = os.getenv("DB_HOST")
+DB_USER = os.getenv("DB_USER")
+DB_NAME = os.getenv("DB_NAME")
 DB_PORT = 5432
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -51,6 +51,10 @@ if "skipped_groups" not in st.session_state:
 
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
+
+# Store selected chapter in session to persist across re-runs
+if "selected_chapter" not in st.session_state:
+    st.session_state["selected_chapter"] = "All Chapters"
 
 class QuestionAudit(BaseModel):
     question_id: int
@@ -73,6 +77,7 @@ class QuestionData:
     role: str
     status: str             # 'active' or 'inactive'
     verification_status: str # 'pending' or 'verified'
+    chapter_name: str       # Added for context
 
 # ==============================================================================
 # 3. DATABASE LOGIC
@@ -95,28 +100,42 @@ def try_connect(password):
     except Exception as e:
         return False, str(e)
 
-def fetch_variant_group(skipped_ids):
+def fetch_all_chapters():
+    """Fetches unique chapter names for the dropdown."""
+    conn = get_db()
+    results = conn.run("SELECT DISTINCT chapter_name FROM question_bank ORDER BY chapter_name")
+    conn.close()
+    return [r[0] for r in results if r[0]] # Filter out None/Empty if any
+
+def fetch_variant_group(skipped_ids, chapter_filter="All Chapters"):
     conn = get_db()
     
-    # Logic: Find a group where verification_status IS NOT 'verified'
+    # Base Filters (Unverified only)
+    filters = ["(verification_status != 'verified' OR verification_status IS NULL)"]
+    params = {}
     
-    if not skipped_ids:
-        group_query = """
-            SELECT DISTINCT variant_group_id 
-            FROM question_bank 
-            WHERE verification_status != 'verified' OR verification_status IS NULL
-            LIMIT 1
-        """
-        group_row = conn.run(group_query)
-    else:
-        group_query = """
-            SELECT DISTINCT variant_group_id 
-            FROM question_bank 
-            WHERE (verification_status != 'verified' OR verification_status IS NULL)
-            AND variant_group_id != ALL(:skip_list)
-            LIMIT 1
-        """
-        group_row = conn.run(group_query, skip_list=skipped_ids)
+    # 1. Apply Chapter Filter
+    if chapter_filter != "All Chapters":
+        filters.append("chapter_name = :chap")
+        params['chap'] = chapter_filter
+        
+    # 2. Apply Skip List
+    if skipped_ids:
+        # pg8000 requires special syntax for list handling or separate logic
+        # Here we use the clean ANY/ALL approach if supported, or manual construction
+        filters.append("variant_group_id != ALL(:skip_list)")
+        params['skip_list'] = skipped_ids
+
+    where_clause = " AND ".join(filters)
+    
+    group_query = f"""
+        SELECT DISTINCT variant_group_id 
+        FROM question_bank 
+        WHERE {where_clause}
+        LIMIT 1
+    """
+    
+    group_row = conn.run(group_query, **params)
     
     if not group_row:
         conn.close()
@@ -124,24 +143,24 @@ def fetch_variant_group(skipped_ids):
 
     target_group_id = group_row[0][0]
 
-    # Fetch columns including the new verification_status
+    # Fetch columns including chapter_name
     questions_query = """
-        SELECT question_id, question_json, explanation, variant_type, role, status, verification_status
+        SELECT question_id, question_json, explanation, variant_type, role, status, verification_status, chapter_name
         FROM question_bank WHERE variant_group_id = :gid ORDER BY question_id ASC
     """
     rows = conn.run(questions_query, gid=target_group_id)
     questions = []
     for row in rows:
-        qid, q_json_str, q_expl, q_var, q_role, q_stat, q_verif = row
+        qid, q_json_str, q_expl, q_var, q_role, q_stat, q_verif, q_chap = row
         q_json = json.loads(q_json_str) if isinstance(q_json_str, str) else q_json_str
         
-        # Handle NULL verification status gracefully
         verif_val = q_verif if q_verif else 'pending'
         
         questions.append(QuestionData(
             question_id=qid, stem=q_json['stem'], options=q_json['options'],
             correct_key=q_json['correct_key'], explanation=q_expl, variant_type=q_var,
-            role=q_role, status=q_stat, verification_status=verif_val
+            role=q_role, status=q_stat, verification_status=verif_val,
+            chapter_name=q_chap
         ))
     conn.close()
     return target_group_id, questions
@@ -153,13 +172,11 @@ def save_edit(qid, new_json, new_expl):
     conn.close()
 
 def update_status_single(qid, new_status):
-    # Updates Active/Inactive ONLY
     conn = get_db()
     conn.run("UPDATE question_bank SET status = :s WHERE question_id = :qid", s=new_status, qid=qid)
     conn.close()
 
 def mark_group_verified(group_id):
-    # Updates Verification Status ONLY
     conn = get_db()
     conn.run("UPDATE question_bank SET verification_status = 'verified' WHERE variant_group_id = :gid", gid=group_id)
     conn.close()
@@ -182,10 +199,31 @@ if not st.session_state["authenticated"]:
 # ==============================================================================
 # 5. MAIN UI
 # ==============================================================================
-if 'group_data' not in st.session_state:
-    st.session_state.group_data = fetch_variant_group(st.session_state["skipped_groups"])
 
-group_id, questions = st.session_state.group_data
+# --- CHAPTER FILTER (Top of Page) ---
+# We fetch chapters only once or on login ideally, but here is fine for simplicity
+all_chapters = fetch_all_chapters()
+selected_chap = st.selectbox(
+    "📂 Filter by Chapter", 
+    ["All Chapters"] + all_chapters,
+    index=0 if st.session_state["selected_chapter"] == "All Chapters" else (["All Chapters"] + all_chapters).index(st.session_state["selected_chapter"])
+)
+
+# Detect Change & Reset
+if selected_chap != st.session_state["selected_chapter"]:
+    st.session_state["selected_chapter"] = selected_chap
+    st.session_state["group_data"] = None # Force re-fetch
+    st.session_state["skipped_groups"] = [] # Optional: Clear skips when changing chapter? Usually yes.
+    st.rerun()
+
+# --- DATA LOADING ---
+if 'group_data' not in st.session_state or st.session_state.group_data is None:
+    st.session_state.group_data = fetch_variant_group(
+        st.session_state["skipped_groups"], 
+        st.session_state["selected_chapter"]
+    )
+
+group_id, questions = st.session_state.group_data if st.session_state.group_data else (None, [])
 
 # Global Status Placeholder
 global_verdict_container = st.empty()
@@ -193,11 +231,11 @@ global_verdict_container.info("⏳ Auditing...")
 
 if not group_id:
     st.balloons()
-    st.success("All questions verified!")
-    if st.button("Reset Session"):
+    msg = f"All questions in '{selected_chap}' verified!"
+    st.success(msg)
+    if st.button("Reset Session / Check Other Chapters"):
         st.session_state["skipped_groups"] = []
-        st.cache_data.clear()
-        st.session_state.group_data = fetch_variant_group([])
+        st.session_state["group_data"] = None
         st.rerun()
     st.stop()
 
@@ -207,20 +245,18 @@ question_feedback_map = {}
 for q in questions:
     
     with st.container(border=True):
-        # Header: Role | Active Status | Verification Status
+        # Header: Role | Active | Verification
         c1, c2, c3 = st.columns([0.6, 0.2, 0.2])
         with c1:
             icon = "🔹" if q.role == "Primary" else "🔗"
             st.markdown(f"**{icon} {q.role}**")
-            st.caption(f"{q.variant_type}")
+            st.caption(f"{q.chapter_name} • {q.variant_type}") # Added Chapter Label
         with c2:
-            # Active/Inactive
             if q.status == 'active':
                 st.markdown('<span style="color:green; font-weight:bold;">ACTIVE</span>', unsafe_allow_html=True)
             else:
                 st.markdown('<span style="color:red; font-weight:bold;">INACTIVE</span>', unsafe_allow_html=True)
         with c3:
-            # Verification Badge
             if q.verification_status == 'verified':
                 st.markdown("✅ Verif")
             else:
@@ -279,17 +315,24 @@ bc1, bc2 = st.columns(2)
 
 if bc1.button("⏭️ Skip Group"):
     st.session_state["skipped_groups"].append(group_id)
-    st.session_state.group_data = fetch_variant_group(st.session_state["skipped_groups"])
+    # Re-fetch using current filters
+    st.session_state.group_data = fetch_variant_group(
+        st.session_state["skipped_groups"],
+        st.session_state["selected_chapter"]
+    )
     st.rerun()
 
 if bc2.button("✅ Verify All", type="primary"):
     mark_group_verified(group_id)
     st.toast("Verified!")
-    st.session_state.group_data = fetch_variant_group(st.session_state["skipped_groups"])
+    st.session_state.group_data = fetch_variant_group(
+        st.session_state["skipped_groups"],
+        st.session_state["selected_chapter"]
+    )
     st.rerun()
 
 # ==============================================================================
-# 6. AI INJECTION (YOUR CUSTOM PROMPT)
+# 6. AI INJECTION
 # ==============================================================================
 prompt = "Audit this medical question set (FCPS Part 1). Focus ONLY on factual accuracy.\n\n"
 
