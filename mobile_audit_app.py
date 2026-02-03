@@ -29,7 +29,7 @@ st.markdown("""
     .element-container { margin-bottom: 1rem; }
     
     .explanation-text {
-        color: #fff; 
+        color: #000; 
         font-size: 0.95em; 
         line-height: 1.5;
     }
@@ -246,7 +246,7 @@ for q in questions:
     
     with st.container(border=True):
         # Header: Role | Active | Verification
-        c1, c2, c3 = st.columns([0.6, 0.2, 0.2])
+        c1, c2 = st.columns([0.6, 0.2])
         with c1:
             icon = "🔹" if q.role == "Primary" else "🔗"
             st.markdown(f"**{icon} {q.role}**")
@@ -256,11 +256,6 @@ for q in questions:
                 st.markdown('<span style="color:green; font-weight:bold;">ACTIVE</span>', unsafe_allow_html=True)
             else:
                 st.markdown('<span style="color:red; font-weight:bold;">INACTIVE</span>', unsafe_allow_html=True)
-        with c3:
-            if q.verification_status == 'verified':
-                st.markdown("✅ Verif")
-            else:
-                st.markdown("⚠️ Pend")
 
         question_feedback_map[q.question_id] = st.empty()
 
