@@ -14,7 +14,7 @@ from google import genai
 st.set_page_config(page_title="FCPS Auditor", layout="centered", page_icon="🩺")
 
 st.markdown("""
-<<style>
+<style>
     /* Tighten container padding */
     [data-testid="stVerticalBlock"] > div {
         gap: 0.5rem;
