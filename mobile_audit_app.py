@@ -14,23 +14,42 @@ from google import genai
 st.set_page_config(page_title="FCPS Auditor", layout="centered", page_icon="🩺")
 
 st.markdown("""
-<style>
+<<style>
+    /* Tighten container padding */
+    [data-testid="stVerticalBlock"] > div {
+        gap: 0.5rem;
+    }
+    div[data-testid="stExpander"] div[role="button"] p {
+        font-weight: 600;
+    }
+    /* Style the Question Containers */
+    .stElementContainer div[data-testid="stVerticalBlockBorderWrapper"] {
+        padding: 1rem !important;
+        margin-bottom: -1rem !important;
+    }
+    /* Buttons styling */
     div.stButton > button {
         width: 100%;
-        border-radius: 8px;
-        height: 40px;
+        border-radius: 6px;
+        height: 36px;
         font-weight: 500;
-        border: 1px solid #ddd;
+        transition: all 0.2s;
+    }
+    div.stButton > button:hover {
+        border-color: #0f9d58;
+        color: #0f9d58;
     }
     div.stButton > button[kind="primary"] {
         background-color: #0f9d58; 
         border-color: #0f9d58;
     }
-    .element-container { margin-bottom: 1rem; }
-    
-    .explanation-text {
-        font-size: 0.95em; 
-        line-height: 1.5;
+    /* Reference Fact Box */
+    .fact-box {
+        background-color: #f8f9fa;
+        border-left: 5px solid #0f9d58;
+        padding: 10px;
+        border-radius: 4px;
+        font-size: 0.95rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -241,25 +260,18 @@ if not group_id:
         st.rerun()
     st.stop()
 
-# 1. FACT TEXT (AT THE TOP)
-st.markdown("### 📖 Reference Fact")
-with st.container(border=True):
-    st.markdown(f"**Card Context:**\n\n{shared_fact}")
-
-st.divider()
+# 1. REFERENCE FACT (Compact)
+with st.expander("📖 View Reference Fact", expanded=True):
+    st.markdown(f"<div class='fact-box'>{shared_fact}</div>", unsafe_allow_html=True)
 
 question_feedback_map = {}
 
-# --- RENDER QUESTIONS ---
+# 2. QUESTIONS LOOP
 for q in questions:
-    
     with st.container(border=True):
-        # Header: Role | Active | Verification
-        c1 = st.columns([0.6, 0.2])
-        with c1:
-            icon = "🔹" if q.role == "Primary" else "🔗"
-            st.markdown(f"**{icon} {q.role}**")
-            st.caption(f"{q.chapter_name} • {q.variant_type}") # Added Chapter Label
+        # Header Row
+        icon = "🔹" if q.role == "Primary" else "🔗"
+        st.markdown(f"**{icon} {q.role}** • <small>{q.variant_type}</small> • `{q.status.upper()}`", unsafe_allow_html=True)
 
         question_feedback_map[q.question_id] = st.empty()
 
@@ -267,11 +279,11 @@ for q in questions:
         
         if st.session_state.get(edit_key, False):
             # === EDIT MODE ===
-            new_stem = st.text_area("Vignette", q.stem, height=100)
+            new_stem = st.text_area("Vignette", q.stem, height=100, key=f"stem_{q.question_id}")
             new_key = st.selectbox("Correct Option", ["A","B","C","D","E"], 
                                    index=["A","B","C","D","E"].index(q.correct_key),
                                    key=f"k_{q.question_id}")
-            new_expl = st.text_area("Explanation", q.explanation)
+            new_expl = st.text_area("Explanation", q.explanation, key=f"expl_{q.question_id}")
             
             b1, b2 = st.columns(2)
             if b1.button("💾 Save", key=f"sv_{q.question_id}", type="primary"):
@@ -284,56 +296,50 @@ for q in questions:
                 st.rerun()
         else:
             # === READ MODE ===
-            st.write(q.stem)
+            st.markdown(f"**Vignette:** {q.stem}")
             
-            for opt in q.options:
-                if opt['key'] == q.correct_key:
-                    st.markdown(f":green[**{opt['key']}) {opt['text']}**]")
-                else:
-                    st.markdown(f"{opt['key']}) {opt['text']}")
+            # Compact Options
+            opt_cols = st.columns(len(q.options))
+            for i, opt in enumerate(q.options):
+                with opt_cols[i]:
+                    is_correct = opt['key'] == q.correct_key
+                    color = "green" if is_correct else "none"
+                    weight = "bold" if is_correct else "normal"
+                    st.markdown(f"<div style='color:{color}; font-weight:{weight}; font-size:0.85rem;'>{opt['key']}) {opt['text']}</div>", unsafe_allow_html=True)
             
-            st.markdown("---")
-            st.markdown("**Explanation**")
-            st.markdown(f"<div class='explanation-text'>{q.explanation}</div>", unsafe_allow_html=True)
+            with st.expander("Explanation Details"):
+                st.markdown(f"<div class='explanation-text'>{q.explanation}</div>", unsafe_allow_html=True)
 
-            st.markdown("---")
-            f1, f2 = st.columns(2)
+            # Row for Action Buttons
+            f1, f2, f3 = st.columns([1, 1, 2])
             if f1.button("✏️ Edit", key=f"ed_{q.question_id}"):
                 st.session_state[edit_key] = True
                 st.rerun()
             
-            tog_text = "Deactivate 🚫" if q.status == 'active' else "Activate ✅"
+            tog_text = "🚫 Deactivate" if q.status == 'active' else "✅ Activate"
             if f2.button(tog_text, key=f"tg_{q.question_id}"):
                 new_s = 'inactive' if q.status == 'active' else 'active'
                 update_status_single(q.question_id, new_s)
                 st.rerun()
 
-# 3. AI VERDICT (BELOW QUESTIONS)
-st.divider()
+# 3. AI VERDICT
 global_verdict_container = st.empty()
 global_verdict_container.info("⏳ AI is auditing these variants...")
 
-# --- BOTTOM BAR ---
+# 4. BOTTOM BAR
 st.divider()
 bc1, bc2 = st.columns(2)
-
-if bc1.button("⏭️ Skip Group"):
-    st.session_state["skipped_groups"].append(group_id)
-    # Re-fetch using current filters
-    st.session_state.group_data = fetch_variant_group(
-        st.session_state["skipped_groups"],
-        st.session_state["selected_chapter"]
-    )
-    st.rerun()
-
-if bc2.button("✅ Verify All", type="primary"):
-    mark_group_verified(group_id)
-    st.toast("Verified!")
-    st.session_state.group_data = fetch_variant_group(
-        st.session_state["skipped_groups"],
-        st.session_state["selected_chapter"]
-    )
-    st.rerun()
+with bc1:
+    if st.button("⏭️ Skip Group"):
+        st.session_state["skipped_groups"].append(group_id)
+        st.session_state.group_data = fetch_variant_group(st.session_state["skipped_groups"], st.session_state["selected_chapter"])
+        st.rerun()
+with bc2:
+    if st.button("✅ Verify All", type="primary"):
+        mark_group_verified(group_id)
+        st.toast("Group Verified!")
+        st.session_state.group_data = fetch_variant_group(st.session_state["skipped_groups"], st.session_state["selected_chapter"])
+        st.rerun()
 
 # ==============================================================================
 # 6. AI INJECTION
