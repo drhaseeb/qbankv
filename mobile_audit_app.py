@@ -29,7 +29,6 @@ st.markdown("""
     .element-container { margin-bottom: 1rem; }
     
     .explanation-text {
-        color: #000; 
         font-size: 0.95em; 
         line-height: 1.5;
     }
@@ -139,31 +138,38 @@ def fetch_variant_group(skipped_ids, chapter_filter="All Chapters"):
     
     if not group_row:
         conn.close()
-        return None, []
+        return None, [], None
 
     target_group_id = group_row[0][0]
 
     # Fetch columns including chapter_name
     questions_query = """
-        SELECT question_id, question_json, explanation, variant_type, role, status, verification_status, chapter_name
-        FROM question_bank WHERE variant_group_id = :gid ORDER BY question_id ASC
+        SELECT q.question_id, q.card_id, q.question_json, q.explanation, 
+               q.variant_type, q.role, q.status, q.verification_status, 
+               q.chapter_name, c.fact_text
+        FROM question_bank q
+        LEFT JOIN concept_cards c ON q.card_id = c.card_id
+        WHERE q.variant_group_id = :gid 
+        ORDER BY q.question_id ASC
     """
     rows = conn.run(questions_query, gid=target_group_id)
     questions = []
+    shared_fact_text = "No reference fact found."
+    if rows:
+        shared_fact_text = rows[0][9]
     for row in rows:
-        qid, q_json_str, q_expl, q_var, q_role, q_stat, q_verif, q_chap = row
+        qid, c_id, q_json_str, q_expl, q_var, q_role, q_stat, q_verif, q_chap, _ = row
         q_json = json.loads(q_json_str) if isinstance(q_json_str, str) else q_json_str
-        
-        verif_val = q_verif if q_verif else 'pending'
         
         questions.append(QuestionData(
             question_id=qid, stem=q_json['stem'], options=q_json['options'],
             correct_key=q_json['correct_key'], explanation=q_expl, variant_type=q_var,
-            role=q_role, status=q_stat, verification_status=verif_val,
+            role=q_role, status=q_stat, verification_status=q_verif or 'pending',
             chapter_name=q_chap
         ))
+        
     conn.close()
-    return target_group_id, questions
+    return target_group_id, questions, shared_fact_text
 
 def save_edit(qid, new_json, new_expl):
     conn = get_db()
@@ -223,11 +229,7 @@ if 'group_data' not in st.session_state or st.session_state.group_data is None:
         st.session_state["selected_chapter"]
     )
 
-group_id, questions = st.session_state.group_data if st.session_state.group_data else (None, [])
-
-# Global Status Placeholder
-global_verdict_container = st.empty()
-global_verdict_container.info("⏳ Auditing...")
+group_id, questions, shared_fact = st.session_state.group_data if st.session_state.group_data else (None, [], None)
 
 if not group_id:
     st.balloons()
@@ -239,6 +241,13 @@ if not group_id:
         st.rerun()
     st.stop()
 
+# 1. FACT TEXT (AT THE TOP)
+st.markdown("### 📖 Reference Fact")
+with st.container(border=True):
+    st.markdown(f"**Card Context:**\n\n{shared_fact}")
+
+st.divider()
+
 question_feedback_map = {}
 
 # --- RENDER QUESTIONS ---
@@ -246,16 +255,11 @@ for q in questions:
     
     with st.container(border=True):
         # Header: Role | Active | Verification
-        c1, c2 = st.columns([0.6, 0.2])
+        c1 = st.columns([0.6, 0.2])
         with c1:
             icon = "🔹" if q.role == "Primary" else "🔗"
             st.markdown(f"**{icon} {q.role}**")
             st.caption(f"{q.chapter_name} • {q.variant_type}") # Added Chapter Label
-        with c2:
-            if q.status == 'active':
-                st.markdown('<span style="color:green; font-weight:bold;">ACTIVE</span>', unsafe_allow_html=True)
-            else:
-                st.markdown('<span style="color:red; font-weight:bold;">INACTIVE</span>', unsafe_allow_html=True)
 
         question_feedback_map[q.question_id] = st.empty()
 
@@ -303,6 +307,11 @@ for q in questions:
                 new_s = 'inactive' if q.status == 'active' else 'active'
                 update_status_single(q.question_id, new_s)
                 st.rerun()
+
+# 3. AI VERDICT (BELOW QUESTIONS)
+st.divider()
+global_verdict_container = st.empty()
+global_verdict_container.info("⏳ AI is auditing these variants...")
 
 # --- BOTTOM BAR ---
 st.divider()
