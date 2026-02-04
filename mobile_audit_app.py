@@ -45,7 +45,6 @@ st.markdown("""
     }
     /* Reference Fact Box */
     .fact-box {
-        background-color: #f8f9fa;
         border-left: 5px solid #0f9d58;
         padding: 10px;
         border-radius: 4px;
@@ -271,7 +270,7 @@ for q in questions:
     with st.container(border=True):
         # Header Row
         icon = "🔹" if q.role == "Primary" else "🔗"
-        st.markdown(f"**{icon} {q.role}** • <small>{q.variant_type}</small> • `{q.status.upper()}`", unsafe_allow_html=True)
+        st.markdown(f"**{icon} {q.role}** • <small>{q.variant_type}</small>", unsafe_allow_html=True)
 
         question_feedback_map[q.question_id] = st.empty()
 
