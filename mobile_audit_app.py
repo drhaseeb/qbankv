@@ -71,13 +71,13 @@ if "ai_result" not in st.session_state: st.session_state["ai_result"] = None
 if "group_data" not in st.session_state: st.session_state["group_data"] = None
 
 class QuestionAudit(BaseModel):
-    question_id: int
+    question_id: str
     status: str       
     feedback: Optional[str] = None
 
 class QuestionPair(BaseModel):
-    primary_id: int
-    backup_id: int
+    primary_id: str
+    backup_id: str
     reasoning: Optional[str] = None
 
 class AuditResponse(BaseModel):
@@ -88,7 +88,7 @@ class AuditResponse(BaseModel):
 
 @dataclass
 class QuestionData:
-    question_id: int
+    question_id: str
     stem: str
     options: List[Dict]
     correct_key: str
