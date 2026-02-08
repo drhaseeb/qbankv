@@ -1,5 +1,6 @@
 import streamlit as st
 import pg8000.native
+import uuid
 import ssl
 import json
 import os
@@ -74,10 +75,16 @@ class QuestionAudit(BaseModel):
     status: str       
     feedback: Optional[str] = None
 
+class QuestionPair(BaseModel):
+    primary_id: int
+    backup_id: int
+    reasoning: Optional[str] = None
+
 class AuditResponse(BaseModel):
     global_verdict: str
     global_summary: Optional[str] = None
     evaluations: List[QuestionAudit]
+    detected_pairs: List[QuestionPair]
 
 @dataclass
 class QuestionData:
@@ -210,6 +217,23 @@ def fetch_variant_group(skipped_ids, chapter_filter="All Chapters"):
         
     conn.close()
     return target_group_id, questions, shared_fact_text
+
+def save_pairings(pairs: List[QuestionPair]):
+    conn = get_db()
+    try:
+        for p in pairs:
+            pair_uuid = str(uuid.uuid4())
+            
+            # Update both the primary and the backup to have this UUID
+            conn.run("""
+                UPDATE question_bank 
+                SET question_group_uuid = :uid 
+                WHERE question_id IN (:p_id, :b_id)
+            """, uid=pair_uuid, p_id=p.primary_id, b_id=p.backup_id)
+    except Exception as e:
+        print(f"Error saving pairings: {e}")
+    finally:
+        conn.close()
 
 def save_edit(qid, new_json, new_expl):
     conn = get_db()
@@ -741,36 +765,41 @@ if st.session_state["ai_result"]:
 
 else:
     # == RUN NEW AUDIT (LAZY) ==
-    # Using st.status creates a nice container that doesn't block previous UI from being visible
-    with st.status("🤖 AI Auditor is analyzing...", expanded=True) as status:
-        prompt = "Audit this medical question set (FCPS Part 1). Focus ONLY on factual accuracy.\n\n"
+    with st.status("🤖 AI Auditor is analyzing & grouping...", expanded=True) as status:
+        prompt = "Audit this medical question set (FCPS Part 1). Focus ONLY on factual accuracy.\n"
+        prompt += "Also, identify which Backup questions are clones of which Primary questions.\n\n"
         prompt += f"Reference Fact (Context): {shared_fact}\n\n"
 
         for q in questions:
             opts_str = ", ".join([f"{o['key']}:{o['text']}" for o in q.options])
             prompt += f"--- QUESTION ID {q.question_id} ---\n"
+            # IMPORTANT: We now include the Role so AI knows which is Primary/Backup
+            prompt += f"Role: {q.role}\n" 
             prompt += f"Stem: {q.stem}\nOptions: {opts_str}\nKey: {q.correct_key}\nExpl: {q.explanation}\n\n"
 
         prompt += """
-        Check for: 
-        1. Factually incorrect medical statements.
-        2. Mismatch between Explanation and Key.
-        3. Logic errors.
+        Tasks:
+        1. VALIDATION: Check for factually incorrect statements, mismatches, or logic errors.
+        2. PAIRING: Identify pairs of (Primary, Backup) questions that test the exact same concept.
+           - A Primary can be paired with a Backup.
 
         OUTPUT JSON FORMAT:
         {
             "global_verdict": "PASS" or "FAIL",
             "global_summary": "Short note if FAIL, null if PASS",
-            "evaluations": [
+            "evaluations":  [
                 { "question_id": 123, "status": "FAIL", "feedback": "Brief feedback." },
                 { "question_id": 456, "status": "PASS", "feedback": null }
+            ],
+            "detected_pairs": [
+                { "primary_id": 123, "backup_id": 124 }
             ]
         }
         """
         
         try:
             response = client.models.generate_content(
-                model='gemini-2.0-flash', # Use a fast model
+                model='gemini-3-flash-preview',
                 contents=prompt,
                 config={
                     'response_mime_type': 'application/json',
@@ -778,10 +807,16 @@ else:
                 }
             )
             res = response.parsed
-            st.session_state["ai_result"] = res
             
-            status.update(label="✅ AI Audit Complete", state="complete", expanded=False)
-            st.rerun() # Rerun once to inject the results into the specific placeholders above
+            # === NEW: SAVE PAIRINGS TO DB AUTOMATICALLY ===
+            if res.detected_pairs:
+                save_pairings(res.detected_pairs)
+                st.toast(f"✅ Auto-grouped {len(res.detected_pairs)} pairs!")
+            # ==============================================
+
+            st.session_state["ai_result"] = res
+            status.update(label="✅ AI Audit & Grouping Complete", state="complete", expanded=False)
+            st.rerun()
 
         except Exception as e:
             status.update(label="⚠️ AI Audit Failed", state="error")
