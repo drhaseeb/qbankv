@@ -227,7 +227,7 @@ def save_pairings(pairs: List[QuestionPair]):
             # Update both the primary and the backup to have this UUID
             conn.run("""
                 UPDATE question_bank 
-                SET question_group_uuid = :uid 
+                SET question_group_id = :uid 
                 WHERE question_id IN (:p_id, :b_id)
             """, uid=pair_uuid, p_id=p.primary_id, b_id=p.backup_id)
     except Exception as e:
