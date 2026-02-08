@@ -273,12 +273,14 @@ def skip_group_callback():
     gid = st.session_state.get("current_group_id")
     if gid:
         st.session_state["skipped_groups"].append(gid)
+        fetch_progress.clear()
         clear_group_state()
 
 def verify_group_callback():
     gid = st.session_state.get("current_group_id")
     if gid:
         mark_group_verified(gid)
+        fetch_progress.clear()
         clear_group_state()
 
 # ==============================================================================
