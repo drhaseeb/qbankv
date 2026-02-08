@@ -220,7 +220,6 @@ def fetch_variant_group(skipped_ids, chapter_filter="All Chapters"):
     return target_group_id, questions, shared_fact_text
 
 def save_pairings(pairs: List[QuestionPair]):
-    """Returns (success_bool, message_log)"""
     conn = get_db()
     log = []
     try:
@@ -427,6 +426,7 @@ with bc2:
 # 6. LAZY AI INJECTION
 # ==============================================================================
 ai_placeholder = st.empty()
+log_placeholder = st.empty()
 
 # Initialize pairing log in session state if not present
 if "pairing_log" not in st.session_state:
@@ -442,8 +442,8 @@ if st.session_state["ai_result"]:
         
     # 2. Show Pairing/Grouping Log (DEBUGGING INFO)
     if st.session_state["pairing_log"]:
-        with ai_placeholder.expander("🧩 Pairing Details (Debug)", expanded=True):
-            st.info(st.session_state["pairing_log"])
+        with log_placeholder.container():
+            st.info(f"**🧩 Grouping Log:**\n\n{st.session_state['pairing_log']}")
     
     # Inject errors into specific question containers
     for ev in res.evaluations:
@@ -499,7 +499,7 @@ else:
             # === SAVE PAIRINGS AND CAPTURE LOG ===
             if res.detected_pairs:
                 success, log_msg = save_pairings(res.detected_pairs)
-                st.session_state["pairing_log"] = log_msg # Save log to session state
+                st.session_state["pairing_log"] = log_msg 
                 if success:
                     st.toast(f"✅ Auto-grouped {len(res.detected_pairs)} pairs!")
                 else:
@@ -509,7 +509,7 @@ else:
             # =====================================
 
             st.session_state["ai_result"] = res
-            status.update(label="✅ AI Audit & Grouping Complete", state="complete", expanded=False)
+            status.update(label="✅ AI Audit Complete", state="complete", expanded=False)
             st.rerun()
 
         except Exception as e:
