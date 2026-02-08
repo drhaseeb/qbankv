@@ -494,9 +494,17 @@ else:
             )
             res = response.parsed
             
+            # === SAVE PAIRINGS AND CAPTURE LOG ===
             if res.detected_pairs:
-                save_pairings(res.detected_pairs)
-                st.toast(f"✅ Auto-grouped {len(res.detected_pairs)} pairs!")
+                success, log_msg = save_pairings(res.detected_pairs)
+                st.session_state["pairing_log"] = log_msg # Save log to session state
+                if success:
+                    st.toast(f"✅ Auto-grouped {len(res.detected_pairs)} pairs!")
+                else:
+                    st.toast("❌ Grouping Failed")
+            else:
+                 st.session_state["pairing_log"] = "No pairs detected by AI."
+            # =====================================
 
             st.session_state["ai_result"] = res
             status.update(label="✅ AI Audit & Grouping Complete", state="complete", expanded=False)
