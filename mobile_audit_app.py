@@ -467,8 +467,9 @@ else:
         Tasks:
         1. VALIDATION: Check for factually incorrect statements, mismatches, or logic errors.
         2. PAIRING: Identify pairs of (Primary, Backup) questions that test the exact same concept.
-           - A Primary can be paired with a Backup.
-        3. Make sure you do not change question_id (uuid).
+           - A Primary can be paired with a Backup_Clone.
+           - One Primary can only pair with one Backup_clone.
+        3. Make sure you do not mix up question_id (uuid).
 
         OUTPUT JSON FORMAT:
         {
