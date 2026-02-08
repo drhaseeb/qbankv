@@ -220,20 +220,32 @@ def fetch_variant_group(skipped_ids, chapter_filter="All Chapters"):
     return target_group_id, questions, shared_fact_text
 
 def save_pairings(pairs: List[QuestionPair]):
+    """Returns (success_bool, message_log)"""
     conn = get_db()
+    log = []
     try:
+        # Check if pairs exist
+        if not pairs:
+            return True, "No pairs detected by AI."
+
         for p in pairs:
             pair_uuid = str(uuid.uuid4())
-            # Update both the primary and the backup to have this UUID
-            # Assuming column name is 'question_group_id' or similar. 
-            # Updated to match typical schema
+            
+            # --- IMPORTANT: CHECK YOUR COLUMN NAME HERE ---
+            # Is it 'question_group_id' or 'question_group_id'? 
+            # I am using 'question_group_id' based on your previous code.
             conn.run("""
                 UPDATE question_bank 
                 SET question_group_id = :uid 
                 WHERE question_id IN (:p_id, :b_id)
             """, uid=pair_uuid, p_id=p.primary_id, b_id=p.backup_id)
+            
+            log.append(f"🔗 Linked Q{p.primary_id} + Q{p.backup_id} (Group ID: {pair_uuid[:8]}...)")
+            
+        return True, "\n\n".join(log)
+        
     except Exception as e:
-        print(f"Error saving pairings: {e}")
+        return False, f"❌ Database Error: {str(e)}"
     finally:
         conn.close()
 
@@ -416,6 +428,10 @@ with bc2:
 # ==============================================================================
 ai_placeholder = st.empty()
 
+# Initialize pairing log in session state if not present
+if "pairing_log" not in st.session_state:
+    st.session_state["pairing_log"] = None
+
 if st.session_state["ai_result"]:
     # == RENDER CACHED RESULTS ==
     res = st.session_state["ai_result"]
@@ -423,6 +439,11 @@ if st.session_state["ai_result"]:
         ai_placeholder.success("✅ **AI VERDICT: PASS**")
     else:
         ai_placeholder.error(f"❌ **AI VERDICT: FAIL** - {res.global_summary}")
+        
+    # 2. Show Pairing/Grouping Log (DEBUGGING INFO)
+    if st.session_state["pairing_log"]:
+        with ai_placeholder.expander("🧩 Pairing Details (Debug)", expanded=True):
+            st.info(st.session_state["pairing_log"])
     
     # Inject errors into specific question containers
     for ev in res.evaluations:
