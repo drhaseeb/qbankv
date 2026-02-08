@@ -468,17 +468,18 @@ else:
         1. VALIDATION: Check for factually incorrect statements, mismatches, or logic errors.
         2. PAIRING: Identify pairs of (Primary, Backup) questions that test the exact same concept.
            - A Primary can be paired with a Backup.
+        3. Make sure you do not change question_id (uuid).
 
         OUTPUT JSON FORMAT:
         {
             "global_verdict": "PASS" or "FAIL",
             "global_summary": "Short note if FAIL, null if PASS",
             "evaluations":  [
-                { "question_id": 123, "status": "FAIL", "feedback": "Brief feedback." },
-                { "question_id": 456, "status": "PASS", "feedback": null }
+                { "question_id": uuid1, "status": "FAIL", "feedback": "Brief feedback." },
+                { "question_id": uuid2, "status": "PASS", "feedback": null }
             ],
             "detected_pairs": [
-                { "primary_id": 123, "backup_id": 124 }
+                { "primary_id": uuid1, "backup_id": uuid2 }
             ]
         }
         """
