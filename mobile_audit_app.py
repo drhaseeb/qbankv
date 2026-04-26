@@ -150,6 +150,8 @@ def run_automation():
            - One Primary can only pair with one Backup_clone.
         3. Make sure you do not mix up question_id (uuid).
 
+        CRITICAL: You must output ONLY valid, raw JSON. Do not include markdown formatting like ```json or any conversational text.
+
         OUTPUT JSON FORMAT:
         {
             "global_verdict": "PASS" or "FAIL",
@@ -168,8 +170,7 @@ def run_automation():
             # Call Gemini
             response = client.models.generate_content(
                 model='gemma-3-27b-it', 
-                contents=prompt,
-                config={'response_mime_type': 'application/json', 'response_schema': AuditResponse}
+                contents=prompt
             )
             res = response.parsed
             
