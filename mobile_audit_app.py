@@ -167,7 +167,7 @@ def run_automation():
         try:
             # Call Gemini
             response = client.models.generate_content(
-                model='gemini-flash-latest', 
+                model='gemma-3-27b-it', 
                 contents=prompt,
                 config={'response_mime_type': 'application/json', 'response_schema': AuditResponse}
             )
